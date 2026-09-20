@@ -1,0 +1,99 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User profile document stored under users/{uid}",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "displayName": { "type": "string" },
+        "email": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastLoginAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Trip": {
+      "title": "Trip",
+      "description": "Trip document stored under trips/{tripId}",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "destination": { "type": "string" },
+        "startDate": { "type": "string" },
+        "endDate": { "type": "string" },
+        "dailyBudget": { "type": "number" },
+        "tripType": { "type": "string", "enum": ["Solo", "Friends", "Family", "Couple"] },
+        "adminId": { "type": "string" },
+        "coAdminId": { "type": ["string", "null"] },
+        "joinCode": { "type": "string" },
+        "status": { "type": "string", "enum": ["Planning", "Active", "Completed"] },
+        "planning": {
+          "type": "object",
+          "description": "Planning parameters collected for itinerary generation",
+          "properties": {
+            "destination": { "type": "string" },
+            "region": { "type": "string" },
+            "startDate": { "type": "string" },
+            "endDate": { "type": "string" },
+            "travelers": { "type": "number" },
+            "tripType": { "type": "string", "enum": ["Solo", "Friends", "Family", "Couple"] },
+            "dailyBudget": { "type": "number" },
+            "interests": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "travelStyle": { "type": "string", "enum": ["Relaxed", "Balanced", "Packed"] },
+            "preferPopular": { "type": "boolean" },
+            "preferHiddenGems": { "type": "boolean" },
+            "preferPlacesCloseTogether": { "type": "boolean" },
+            "minimizeTravelTime": { "type": "boolean" },
+            "preferLowerCost": { "type": "boolean" },
+            "updatedAt": { "type": "string", "format": "date-time" }
+          }
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "name",
+        "destination",
+        "startDate",
+        "endDate",
+        "dailyBudget",
+        "tripType",
+        "adminId",
+        "joinCode",
+        "status"
+      ]
+    },
+    "TripMember": {
+      "title": "Trip Member",
+      "description": "Member document stored under trips/{tripId}/members/{uid}",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "co-admin", "member"] },
+        "joinedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "role"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User account document containing basic profile and timestamps"
+    },
+    "/trips/{tripId}": {
+      "schema": "Trip",
+      "description": "Trip entity tracking core parameters, roles, and status"
+    },
+    "/trips/{tripId}/members/{memberUid}": {
+      "schema": "TripMember",
+      "description": "Trip membership record defining user role (admin, co-admin, member)"
+    }
+  }
+}

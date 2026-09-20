@@ -1,0 +1,6 @@
+{
+  "name": "TravelPilot",
+  "description": "Intelligent travel planning and disruption-management application.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
