@@ -78,7 +78,7 @@ export const MyTripsView: React.FC<MyTripsViewProps> = ({
   };
 
   const handlePlanTripClick = () => {
-    setCreateModalOpen(true);
+    onNavigatePlan();
   };
 
   // Open Edit Name Modal
@@ -297,7 +297,7 @@ export const MyTripsView: React.FC<MyTripsViewProps> = ({
                 id="btn-empty-plan"
                 variant="primary"
                 size="sm"
-                onClick={() => setCreateModalOpen(true)}
+                onClick={() => onNavigatePlan()}
                 icon={<Plus className="w-3.5 h-3.5" />}
               >
                 Plan a Trip

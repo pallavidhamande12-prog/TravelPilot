@@ -26,7 +26,7 @@ export const Header: React.FC<HeaderProps> = ({
   currentView = 'dashboard',
   onNavigate,
 }) => {
-  const { user, profile, signOut } = useAuth();
+  const { user, profile, signOut, signInWithGoogle, isDemoUser } = useAuth();
   const [isEditProfileOpen, setIsEditProfileOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
@@ -150,6 +150,11 @@ export const Header: React.FC<HeaderProps> = ({
                   <span className="text-xs font-semibold text-[#1F2421] max-w-[110px] truncate hidden sm:inline-block">
                     {displayName.split(' ')[0]}
                   </span>
+                  {isDemoUser && (
+                    <span className="hidden sm:inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold bg-[#EEF4F3] text-[#2E5658] border border-[#D3E2E0]">
+                      Demo
+                    </span>
+                  )}
                   <ChevronDown className="w-3.5 h-3.5 text-[#5C6460] transition-transform duration-150" />
                 </button>
 
@@ -160,9 +165,16 @@ export const Header: React.FC<HeaderProps> = ({
                     className="absolute right-0 mt-2 w-60 rounded-2xl bg-white border border-[#E8E2D9] shadow-lg py-2 z-50 animate-in fade-in zoom-in-95 duration-100"
                   >
                     <div className="px-4 py-3 border-b border-[#E8E2D9] bg-[#FAF7F2]/50">
-                      <p className="text-xs font-semibold text-[#1F2421] truncate">
-                        {displayName}
-                      </p>
+                      <div className="flex items-center justify-between gap-1">
+                        <p className="text-xs font-semibold text-[#1F2421] truncate">
+                          {displayName}
+                        </p>
+                        {isDemoUser && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-[#EBF3ED] text-[#2E5658] border border-[#D0E2D6]">
+                            Demo User
+                          </span>
+                        )}
+                      </div>
                       <p className="text-[11px] text-[#5C6460] truncate mt-0.5">
                         {email}
                       </p>
@@ -194,6 +206,25 @@ export const Header: React.FC<HeaderProps> = ({
                     </div>
 
                     <div className="border-t border-[#E8E2D9] pt-1">
+                      {isDemoUser && (
+                        <button
+                          type="button"
+                          id="menu-btn-connect-google"
+                          onClick={async () => {
+                            setIsUserMenuOpen(false);
+                            try {
+                              await signInWithGoogle();
+                            } catch {
+                              // Handled gracefully in AuthContext
+                            }
+                          }}
+                          className="w-full flex items-center gap-2.5 px-4 py-2 text-xs font-medium text-[#2E5658] hover:bg-[#EEF4F3] transition-colors"
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-[#2E5658]" />
+                          <span>Connect Google Account</span>
+                        </button>
+                      )}
+
                       <button
                         type="button"
                         id="menu-btn-signout"

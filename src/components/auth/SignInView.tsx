@@ -1,12 +1,15 @@
 import React, { useState } from 'react';
-import { Compass, AlertCircle, ArrowRight } from 'lucide-react';
+import { Compass, AlertCircle, ArrowRight, Sparkles, Copy, Check, ShieldAlert } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 
 export const SignInView: React.FC = () => {
-  const { signInWithGoogle, error, clearError } = useAuth();
+  const { signInWithGoogle, signInAsDemo, error, clearError } = useAuth();
   const [isSigningIn, setIsSigningIn] = useState(false);
+  const [copiedOrigin, setCopiedOrigin] = useState(false);
+
+  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : '';
 
   const handleGoogleSignIn = async () => {
     setIsSigningIn(true);
@@ -19,6 +22,28 @@ export const SignInView: React.FC = () => {
       setIsSigningIn(false);
     }
   };
+
+  const handleDemoSignIn = () => {
+    clearError();
+    signInAsDemo();
+  };
+
+  const handleCopyOrigin = () => {
+    if (currentOrigin) {
+      navigator.clipboard.writeText(currentOrigin);
+      setCopiedOrigin(true);
+      setTimeout(() => setCopiedOrigin(false), 2000);
+    }
+  };
+
+  const isRefererBlockedError =
+    Boolean(error) &&
+    (error?.toLowerCase().includes('requests-from-referer') ||
+      error?.toLowerCase().includes('are-blocked') ||
+      error?.toLowerCase().includes('authorized domains') ||
+      error?.toLowerCase().includes('unauthorized-domain') ||
+      error?.toLowerCase().includes('action is invalid') ||
+      error?.toLowerCase().includes('invalid-action-code'));
 
   return (
     <div
@@ -35,11 +60,11 @@ export const SignInView: React.FC = () => {
             TravelPilot
           </span>
         </div>
-        <Badge variant="neutral">Part 2 &mdash; Auth</Badge>
+        <Badge variant="neutral">Smart Travel Studio</Badge>
       </header>
 
       {/* Main Sign-In Hero Centerpiece */}
-      <main className="max-w-md w-full mx-auto my-auto py-12">
+      <main className="max-w-lg w-full mx-auto my-auto py-8">
         <Card id="signin-card" variant="surface" className="p-8 sm:p-10 text-center shadow-sm space-y-6">
           {/* Brand Icon & Welcome */}
           <div className="space-y-3">
@@ -57,31 +82,107 @@ export const SignInView: React.FC = () => {
           </div>
 
           <p className="text-sm text-[#78716C] leading-relaxed">
-            Sign in to access your personal trip workspace, monitor schedule changes, and re-plan itineraries.
+            Plan multi-day trips with AI-curated pacing, dynamic budget tracking, and real-time disruption re-routing.
           </p>
 
           {/* Error Message if any */}
           {error && (
             <div
               id="signin-error-banner"
-              className="flex items-start gap-2.5 p-3 rounded-xl bg-[#FAF2EF] border border-[#F3D5C8] text-[#CF8A70] text-xs text-left"
+              className="p-4 rounded-xl bg-[#FFF8F6] border border-[#F3D5C8] text-xs text-left space-y-2.5"
             >
-              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-              <div className="flex-1">
-                <p className="font-medium">Authentication issue</p>
-                <p className="mt-0.5">{error}</p>
+              <div className="flex items-start gap-2 text-[#CF8A70] font-semibold">
+                {isRefererBlockedError ? (
+                  <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5 text-[#CF8A70]" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-[#CF8A70]" />
+                )}
+                <span>
+                  {isRefererBlockedError
+                    ? 'Google Cloud Origin Restriction Detected'
+                    : 'Authentication Note'}
+                </span>
               </div>
+
+              <p className="text-[#685F58] leading-relaxed">
+                {isRefererBlockedError
+                  ? 'Your current deployment domain is restricted by the Google API Key or Firebase Authorized Domains configuration.'
+                  : error}
+              </p>
+
+              {isRefererBlockedError && currentOrigin && (
+                <div className="space-y-2 pt-1">
+                  <div className="p-2 rounded-lg bg-white border border-[#E8E2D9] font-mono text-[11px] text-[#2E5658] flex items-center justify-between gap-2 overflow-x-auto">
+                    <span className="truncate">{currentOrigin}</span>
+                    <button
+                      type="button"
+                      id="copy-origin-btn"
+                      onClick={handleCopyOrigin}
+                      className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded bg-[#FAF8F5] hover:bg-[#F2EDE4] text-[#1F2421] text-[10px] font-sans border border-[#E0D9CE] transition-colors"
+                    >
+                      {copiedOrigin ? (
+                        <>
+                          <Check className="w-3 h-3 text-[#2E5658]" />
+                          <span>Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3 text-[#5C6460]" />
+                          <span>Copy URL</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-[#78716C]">
+                    To enable Google Sign-In, add this URL to{' '}
+                    <strong className="text-[#1F2421]">Firebase Console &gt; Authentication &gt; Settings &gt; Authorized domains</strong>{' '}
+                    and under your Google Cloud API key website restrictions.
+                  </p>
+                </div>
+              )}
+
+              <button
+                type="button"
+                id="btn-error-demo-bypass"
+                onClick={handleDemoSignIn}
+                className="w-full mt-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-[#2E5658] text-white font-medium text-xs hover:bg-[#244547] transition-colors shadow-2xs"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Continue Instantly with Demo Mode</span>
+              </button>
             </div>
           )}
 
-          {/* Primary Action: Continue with Google */}
-          <div className="pt-2">
+          {/* Primary Action: Instant Demo Access */}
+          <div className="space-y-3 pt-1">
+            <button
+              id="btn-signin-demo"
+              type="button"
+              onClick={handleDemoSignIn}
+              className="w-full flex items-center justify-center gap-2.5 px-5 py-3.5 rounded-xl bg-[#2E5658] hover:bg-[#244547] text-white font-semibold text-sm focus:outline-none focus:ring-2 focus:ring-[#2E5658] focus:ring-offset-2 transition-all shadow-sm"
+            >
+              <Sparkles className="w-4 h-4 text-[#F7F4EB]" />
+              <span>Explore TravelPilot (Instant Access)</span>
+              <ArrowRight className="w-4 h-4 text-[#F7F4EB]/80 ml-auto" />
+            </button>
+            <p className="text-[11px] text-[#78716C] text-center">
+              No login or setup needed &bull; Kyoto &amp; Amalfi trips, AI planning, and disruption tools ready.
+            </p>
+
+            <div className="relative flex items-center justify-center py-2">
+              <div className="border-t border-[#E8E2D9] w-full" />
+              <span className="bg-[#FFFFFF] px-3 text-[11px] text-[#78716C] font-medium uppercase tracking-wider absolute">
+                or sign in with Google
+              </span>
+            </div>
+
+            {/* Secondary Action: Continue with Google */}
             <button
               id="btn-signin-google"
               type="button"
               disabled={isSigningIn}
               onClick={handleGoogleSignIn}
-              className="w-full flex items-center justify-center gap-3 px-5 py-3 rounded-xl border border-[#E8E2D9] bg-white text-[#1F2421] font-medium text-sm hover:bg-[#FAF8F5] hover:border-[#D0C7B8] focus:outline-none focus:ring-2 focus:ring-[#2E5658] focus:ring-offset-2 transition-all shadow-xs disabled:opacity-60 disabled:cursor-not-allowed"
+              className="w-full flex items-center justify-center gap-3 px-5 py-3 rounded-xl border border-[#D3E2E0] bg-[#FAF8F5] text-[#1F2421] font-medium text-sm hover:bg-[#F2EDE4] hover:border-[#B5CDC9] focus:outline-none focus:ring-2 focus:ring-[#2E5658] focus:ring-offset-2 transition-all shadow-2xs disabled:opacity-60 disabled:cursor-not-allowed"
             >
               {isSigningIn ? (
                 <div className="w-5 h-5 border-2 border-[#2E5658] border-t-transparent rounded-full animate-spin" />
@@ -108,6 +209,9 @@ export const SignInView: React.FC = () => {
               <span>{isSigningIn ? 'Connecting to Google...' : 'Continue with Google'}</span>
               {!isSigningIn && <ArrowRight className="w-4 h-4 text-[#78716C] ml-auto" />}
             </button>
+            <p className="text-[10px] text-[#78716C] text-center">
+              Requires this preview origin to be in your Firebase / Google Cloud authorized domains.
+            </p>
           </div>
 
           <div className="pt-2 text-xs text-[#78716C]">

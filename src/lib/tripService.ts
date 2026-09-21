@@ -14,6 +14,14 @@ import {
 import { db } from './firebase';
 import { Trip, TripMember, UserTrip, CreateTripInput, TripMemberRole, TripPlanningParameters, TripItinerary, TripStay } from '../types';
 import { calculateTripProgress } from '../utils/tripProgress';
+import {
+  createLocalTrip,
+  deleteLocalTrip,
+  getLocalTripDetails,
+  getLocalUserTrips,
+  loadLocalTrips,
+  updateLocalTrip,
+} from './localTripStore';
 
 /**
  * Remove or sanitize undefined fields so Firestore serialization never throws
@@ -40,23 +48,26 @@ export function generateRandomCode(length = 6): string {
  * Ensures join code is unique among active trips.
  */
 async function generateUniqueJoinCode(): Promise<string> {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const candidate = generateRandomCode(6);
-    const q = query(
-      collection(db, 'trips'),
-      where('joinCode', '==', candidate)
-    );
-    const snap = await getDocs(q);
-    if (snap.empty) {
-      return candidate;
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = generateRandomCode(6);
+      const q = query(
+        collection(db, 'trips'),
+        where('joinCode', '==', candidate)
+      );
+      const snap = await getDocs(q);
+      if (snap.empty) {
+        return candidate;
+      }
     }
+  } catch {
+    // If Firestore query fails (e.g. referer blocked or offline), return random candidate
   }
-  // Fallback with timestamp suffix if collisions occur
   return generateRandomCode(4) + Math.floor(10 + Math.random() * 89);
 }
 
 /**
- * Create a new trip in Firestore.
+ * Create a new trip in Firestore (or local store in demo/fallback mode).
  *
  * Rules:
  * - adminId = Firebase UID of creator
@@ -84,49 +95,59 @@ export async function createTrip(
   }
   if (!input.tripType) throw new Error('Trip type is required.');
 
-  // 2. Generate Doc Ref & Join Code
-  const tripRef = doc(collection(db, 'trips'));
-  const joinCode = await generateUniqueJoinCode();
-
-  const tripData: Record<string, unknown> = {
-    id: tripRef.id,
-    name: input.name.trim(),
-    destination: input.destination.trim(),
-    startDate: input.startDate,
-    endDate: input.endDate,
-    dailyBudget: Number(input.dailyBudget),
-    tripType: input.tripType,
-    adminId: userId,
-    coAdminId: null,
-    joinCode,
-    status: 'Planning',
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  };
-
-  if (input.stay) {
-    tripData.stay = cleanUndefinedFields(input.stay);
+  // Demo user mode
+  if (userId.startsWith('demo-')) {
+    return createLocalTrip(input, userId);
   }
 
-  const memberRef = doc(db, 'trips', tripRef.id, 'members', userId);
-  const memberData: Record<string, unknown> = {
-    uid: userId,
-    role: 'admin',
-    displayName: userDisplayName || 'TravelPilot Member',
-    photoURL: userPhotoURL || '',
-    joinedAt: serverTimestamp(),
-  };
+  try {
+    // 2. Generate Doc Ref & Join Code
+    const tripRef = doc(collection(db, 'trips'));
+    const joinCode = await generateUniqueJoinCode();
 
-  // 3. Atomic Batch Commit
-  const batch = writeBatch(db);
-  batch.set(tripRef, tripData);
-  batch.set(memberRef, memberData);
-  await batch.commit();
+    const tripData: Record<string, unknown> = {
+      id: tripRef.id,
+      name: input.name.trim(),
+      destination: input.destination.trim(),
+      startDate: input.startDate,
+      endDate: input.endDate,
+      dailyBudget: Number(input.dailyBudget),
+      tripType: input.tripType,
+      adminId: userId,
+      coAdminId: null,
+      joinCode,
+      status: 'Planning',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
 
-  return {
-    ...(tripData as unknown as Trip),
-    id: tripRef.id,
-  };
+    if (input.stay) {
+      tripData.stay = cleanUndefinedFields(input.stay);
+    }
+
+    const memberRef = doc(db, 'trips', tripRef.id, 'members', userId);
+    const memberData: Record<string, unknown> = {
+      uid: userId,
+      role: 'admin',
+      displayName: userDisplayName || 'TravelPilot Member',
+      photoURL: userPhotoURL || '',
+      joinedAt: serverTimestamp(),
+    };
+
+    // 3. Atomic Batch Commit
+    const batch = writeBatch(db);
+    batch.set(tripRef, tripData);
+    batch.set(memberRef, memberData);
+    await batch.commit();
+
+    return {
+      ...(tripData as unknown as Trip),
+      id: tripRef.id,
+    };
+  } catch (err) {
+    console.warn('Firestore createTrip failed, saving to local trip store:', err);
+    return createLocalTrip(input, userId);
+  }
 }
 
 /**
@@ -138,6 +159,10 @@ export async function createTrip(
  * - trips where the authenticated user has a member document
  */
 export async function getUserTrips(userId: string): Promise<UserTrip[]> {
+  if (userId.startsWith('demo-')) {
+    return getLocalUserTrips(userId);
+  }
+
   const tripMap = new Map<string, UserTrip>();
 
   try {
@@ -198,6 +223,14 @@ export async function getUserTrips(userId: string): Promise<UserTrip[]> {
   }
 
   const trips = Array.from(tripMap.values());
+  if (trips.length === 0) {
+    // Check if user has any local trips created while offline
+    const local = getLocalUserTrips(userId);
+    if (local.length > 0) {
+      return local;
+    }
+  }
+
   // Sort by start date (soonest first)
   trips.sort((a, b) => (a.startDate > b.startDate ? 1 : -1));
 
@@ -225,49 +258,72 @@ export async function joinTripWithCode(
     throw new Error('Please enter a valid trip code.');
   }
 
-  // Query for trip with joinCode
-  const q = query(
-    collection(db, 'trips'),
-    where('joinCode', '==', cleanCode)
-  );
-  const snap = await getDocs(q);
-
-  if (snap.empty) {
-    throw new Error('Invalid trip code. Please check the code and try again.');
+  // Check local trips first (for demo or local mode)
+  try {
+    const localTrips = loadLocalTrips();
+    const localTrip = localTrips.find((t: Trip) => t.joinCode === cleanCode);
+    if (localTrip) {
+      return {
+        status: 'joined',
+        trip: localTrip,
+        role: localTrip.adminId === userId ? 'admin' : 'member',
+      };
+    }
+  } catch {
+    // Ignore local check error
   }
 
-  const tripDoc = snap.docs[0];
-  const trip = { ...tripDoc.data(), id: tripDoc.id } as Trip;
+  try {
+    // Query for trip with joinCode
+    const q = query(
+      collection(db, 'trips'),
+      where('joinCode', '==', cleanCode)
+    );
+    const snap = await getDocs(q);
 
-  // Check existing membership
-  const memberRef = doc(db, 'trips', trip.id, 'members', userId);
-  const memberSnap = await getDoc(memberRef);
+    if (snap.empty) {
+      throw new Error('Invalid trip code. Please check the code and try again.');
+    }
 
-  if (memberSnap.exists()) {
-    const existingRole = memberSnap.data().role as TripMemberRole;
+    const tripDoc = snap.docs[0];
+    const trip = { ...tripDoc.data(), id: tripDoc.id } as Trip;
+
+    // Check existing membership
+    const memberRef = doc(db, 'trips', trip.id, 'members', userId);
+    const memberSnap = await getDoc(memberRef);
+
+    if (memberSnap.exists()) {
+      const existingRole = memberSnap.data().role as TripMemberRole;
+      return {
+        status: 'already_member',
+        trip,
+        role: existingRole,
+      };
+    }
+
+    // If user is creator (adminId), set as admin, otherwise regular member
+    const role: TripMemberRole = trip.adminId === userId ? 'admin' : 'member';
+
+    await setDoc(memberRef, {
+      uid: userId,
+      role,
+      displayName: userDisplayName || 'TravelPilot Member',
+      photoURL: userPhotoURL || '',
+      joinedAt: serverTimestamp(),
+    });
+
     return {
-      status: 'already_member',
+      status: 'joined',
       trip,
-      role: existingRole,
+      role,
     };
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('Invalid trip code')) {
+      throw err;
+    }
+    console.warn('Firestore joinTripWithCode failed:', err);
+    throw new Error('Could not join trip with this code. Please check and try again.');
   }
-
-  // If user is creator (adminId), set as admin, otherwise regular member
-  const role: TripMemberRole = trip.adminId === userId ? 'admin' : 'member';
-
-  await setDoc(memberRef, {
-    uid: userId,
-    role,
-    displayName: userDisplayName || 'TravelPilot Member',
-    photoURL: userPhotoURL || '',
-    joinedAt: serverTimestamp(),
-  });
-
-  return {
-    status: 'joined',
-    trip,
-    role,
-  };
 }
 
 /**
@@ -277,76 +333,89 @@ export async function getTripDetails(
   tripId: string,
   userId: string
 ): Promise<{ trip: Trip; userRole: TripMemberRole; members: TripMember[] }> {
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
-
-  if (!tripSnap.exists()) {
-    throw new Error('Trip not found or you do not have permission to view it.');
-  }
-
-  const trip = { ...tripSnap.data(), id: tripSnap.id } as Trip;
-  if (trip.itinerary) {
-    const stats = calculateTripProgress(trip.itinerary);
-    trip.status = stats.derivedStatus;
-  }
-
-  // Fetch current user's role from members subcollection
-  const myMemberRef = doc(db, 'trips', tripId, 'members', userId);
-  const myMemberSnap = await getDoc(myMemberRef);
-
-  let userRole: TripMemberRole = 'member';
-  if (myMemberSnap.exists()) {
-    userRole = myMemberSnap.data().role as TripMemberRole;
-  } else if (trip.adminId === userId) {
-    userRole = 'admin';
-  } else if (trip.coAdminId === userId) {
-    userRole = 'co-admin';
-  } else {
-    throw new Error('Access denied. You are not a member of this trip.');
-  }
-
-  // Fetch all trip members
-  const membersRef = collection(db, 'trips', tripId, 'members');
-  const membersSnap = await getDocs(membersRef);
-
-  const memberPromises = membersSnap.docs.map(async (d) => {
-    const data = d.data();
-    let displayName = (data.displayName as string | undefined)?.trim();
-    let photoURL = data.photoURL as string | undefined;
-
-    // Fetch user profile from users/{uid} for fresh displayName if available
+  if (userId.startsWith('demo-') || tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
     try {
-      const userDocRef = doc(db, 'users', d.id);
-      const userDocSnap = await getDoc(userDocRef);
-      if (userDocSnap.exists()) {
-        const uData = userDocSnap.data();
-        if (uData.displayName && uData.displayName.trim()) {
-          displayName = uData.displayName.trim();
-        }
-        if (uData.photoURL) {
-          photoURL = uData.photoURL;
-        }
-      }
+      return getLocalTripDetails(tripId, userId);
     } catch {
-      // Graceful fallback to member document or default
+      // Fall through to Firestore
+    }
+  }
+
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
+
+    if (!tripSnap.exists()) {
+      return getLocalTripDetails(tripId, userId);
     }
 
-    // Explicit fallback: if member's displayName is unavailable, use "TravelPilot Member"
-    // Never display Firebase UID as visible name
-    const finalDisplayName = displayName || 'TravelPilot Member';
+    const trip = { ...tripSnap.data(), id: tripSnap.id } as Trip;
+    if (trip.itinerary) {
+      const stats = calculateTripProgress(trip.itinerary);
+      trip.status = stats.derivedStatus;
+    }
 
-    return {
-      uid: d.id,
-      role: data.role as TripMemberRole,
-      displayName: finalDisplayName,
-      photoURL: photoURL || undefined,
-      joinedAt: data.joinedAt,
-    };
-  });
+    // Fetch current user's role from members subcollection
+    const myMemberRef = doc(db, 'trips', tripId, 'members', userId);
+    const myMemberSnap = await getDoc(myMemberRef);
 
-  const members: TripMember[] = await Promise.all(memberPromises);
+    let userRole: TripMemberRole = 'member';
+    if (myMemberSnap.exists()) {
+      userRole = myMemberSnap.data().role as TripMemberRole;
+    } else if (trip.adminId === userId) {
+      userRole = 'admin';
+    } else if (trip.coAdminId === userId) {
+      userRole = 'co-admin';
+    } else {
+      userRole = 'member';
+    }
 
-  return { trip, userRole, members };
+    // Fetch all trip members
+    const membersRef = collection(db, 'trips', tripId, 'members');
+    const membersSnap = await getDocs(membersRef);
+
+    const memberPromises = membersSnap.docs.map(async (d) => {
+      const data = d.data();
+      let displayName = (data.displayName as string | undefined)?.trim();
+      let photoURL = data.photoURL as string | undefined;
+
+      // Fetch user profile from users/{uid} for fresh displayName if available
+      try {
+        const userDocRef = doc(db, 'users', d.id);
+        const userDocSnap = await getDoc(userDocRef);
+        if (userDocSnap.exists()) {
+          const uData = userDocSnap.data();
+          if (uData.displayName && uData.displayName.trim()) {
+            displayName = uData.displayName.trim();
+          }
+          if (uData.photoURL) {
+            photoURL = uData.photoURL;
+          }
+        }
+      } catch {
+        // Graceful fallback to member document or default
+      }
+
+      // Explicit fallback: if member's displayName is unavailable, use "TravelPilot Member"
+      // Never display Firebase UID as visible name
+      const finalDisplayName = displayName || 'TravelPilot Member';
+
+      return {
+        uid: d.id,
+        role: data.role as TripMemberRole,
+        displayName: finalDisplayName,
+        photoURL: photoURL || undefined,
+        joinedAt: data.joinedAt,
+      };
+    });
+
+    const members: TripMember[] = await Promise.all(memberPromises);
+
+    return { trip, userRole, members };
+  } catch (err) {
+    console.warn('Firestore getTripDetails failed, attempting local fallback:', err);
+    return getLocalTripDetails(tripId, userId);
+  }
 }
 
 /**
@@ -358,13 +427,6 @@ export async function saveTripPlanningParameters(
   tripId: string,
   planning: TripPlanningParameters
 ): Promise<Trip> {
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
-
-  if (!tripSnap.exists()) {
-    throw new Error('Trip not found.');
-  }
-
   // Validate required fields
   if (!planning.destination?.trim()) {
     throw new Error('Destination is required.');
@@ -391,45 +453,87 @@ export async function saveTripPlanningParameters(
     throw new Error('Travel style is required.');
   }
 
-  const planningData: Record<string, unknown> = {
-    origin: planning.origin?.trim() || '',
-    destination: planning.destination.trim(),
-    region: planning.region?.trim() || '',
-    startDate: planning.startDate,
-    endDate: planning.endDate,
-    travelers: Number(planning.travelers),
-    tripType: planning.tripType,
-    dailyBudget: Number(planning.dailyBudget),
-    interests: planning.interests || [],
-    travelStyle: planning.travelStyle,
-    preferPopular: Boolean(planning.preferPopular),
-    preferHiddenGems: Boolean(planning.preferHiddenGems),
-    preferPlacesCloseTogether: Boolean(planning.preferPlacesCloseTogether),
-    minimizeTravelTime: Boolean(planning.minimizeTravelTime),
-    preferLowerCost: Boolean(planning.preferLowerCost),
-    stay: planning.stay ? cleanUndefinedFields(planning.stay) : null,
-    updatedAt: serverTimestamp(),
-  };
-
-  const tripUpdates: Record<string, unknown> = {
-    planning: planningData,
-    destination: planning.destination.trim(),
-    startDate: planning.startDate,
-    endDate: planning.endDate,
-    dailyBudget: Number(planning.dailyBudget),
-    tripType: planning.tripType,
-    updatedAt: serverTimestamp(),
-  };
-
-  if (planning.stay !== undefined) {
-    tripUpdates.stay = planning.stay ? cleanUndefinedFields(planning.stay) : null;
+  if (tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      planning,
+      destination: planning.destination.trim(),
+      startDate: planning.startDate,
+      endDate: planning.endDate,
+      dailyBudget: Number(planning.dailyBudget),
+      tripType: planning.tripType,
+      stay: planning.stay !== undefined ? planning.stay : trip.stay,
+    }));
   }
 
-  // Update trip doc, synchronizing top-level fields
-  await updateDoc(tripRef, tripUpdates);
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
 
-  const updatedSnap = await getDoc(tripRef);
-  return { ...updatedSnap.data(), id: updatedSnap.id } as Trip;
+    if (!tripSnap.exists()) {
+      return updateLocalTrip(tripId, (trip) => ({
+        ...trip,
+        planning,
+        destination: planning.destination.trim(),
+        startDate: planning.startDate,
+        endDate: planning.endDate,
+        dailyBudget: Number(planning.dailyBudget),
+        tripType: planning.tripType,
+        stay: planning.stay !== undefined ? planning.stay : trip.stay,
+      }));
+    }
+
+    const planningData: Record<string, unknown> = {
+      origin: planning.origin?.trim() || '',
+      destination: planning.destination.trim(),
+      region: planning.region?.trim() || '',
+      startDate: planning.startDate,
+      endDate: planning.endDate,
+      travelers: Number(planning.travelers),
+      tripType: planning.tripType,
+      dailyBudget: Number(planning.dailyBudget),
+      interests: planning.interests || [],
+      travelStyle: planning.travelStyle,
+      preferPopular: Boolean(planning.preferPopular),
+      preferHiddenGems: Boolean(planning.preferHiddenGems),
+      preferPlacesCloseTogether: Boolean(planning.preferPlacesCloseTogether),
+      minimizeTravelTime: Boolean(planning.minimizeTravelTime),
+      preferLowerCost: Boolean(planning.preferLowerCost),
+      stay: planning.stay ? cleanUndefinedFields(planning.stay) : null,
+      updatedAt: serverTimestamp(),
+    };
+
+    const tripUpdates: Record<string, unknown> = {
+      planning: planningData,
+      destination: planning.destination.trim(),
+      startDate: planning.startDate,
+      endDate: planning.endDate,
+      dailyBudget: Number(planning.dailyBudget),
+      tripType: planning.tripType,
+      updatedAt: serverTimestamp(),
+    };
+
+    if (planning.stay !== undefined) {
+      tripUpdates.stay = planning.stay ? cleanUndefinedFields(planning.stay) : null;
+    }
+
+    await updateDoc(tripRef, tripUpdates);
+
+    const updatedSnap = await getDoc(tripRef);
+    return { ...updatedSnap.data(), id: updatedSnap.id } as Trip;
+  } catch (err) {
+    console.warn('Firestore saveTripPlanningParameters failed, saving to local store:', err);
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      planning,
+      destination: planning.destination.trim(),
+      startDate: planning.startDate,
+      endDate: planning.endDate,
+      dailyBudget: Number(planning.dailyBudget),
+      tripType: planning.tripType,
+      stay: planning.stay !== undefined ? planning.stay : trip.stay,
+    }));
+  }
 }
 
 /**
@@ -440,28 +544,47 @@ export async function saveTripItinerary(
   tripId: string,
   itinerary: TripItinerary
 ): Promise<Trip> {
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
+  const cleanItinerary = cleanUndefinedFields(itinerary);
 
-  if (!tripSnap.exists()) {
-    throw new Error('Trip not found.');
+  if (tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      itinerary: cleanItinerary,
+    }));
   }
 
-  const cleanItinerary = cleanUndefinedFields(itinerary);
-  const stats = calculateTripProgress(cleanItinerary);
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
 
-  await updateDoc(tripRef, {
-    itinerary: cleanItinerary,
-    status: stats.derivedStatus,
-    updatedAt: serverTimestamp(),
-  });
+    if (!tripSnap.exists()) {
+      return updateLocalTrip(tripId, (trip) => ({
+        ...trip,
+        itinerary: cleanItinerary,
+      }));
+    }
 
-  const updatedSnap = await getDoc(tripRef);
-  return {
-    ...updatedSnap.data(),
-    id: updatedSnap.id,
-    status: stats.derivedStatus,
-  } as Trip;
+    const stats = calculateTripProgress(cleanItinerary);
+
+    await updateDoc(tripRef, {
+      itinerary: cleanItinerary,
+      status: stats.derivedStatus,
+      updatedAt: serverTimestamp(),
+    });
+
+    const updatedSnap = await getDoc(tripRef);
+    return {
+      ...updatedSnap.data(),
+      id: updatedSnap.id,
+      status: stats.derivedStatus,
+    } as Trip;
+  } catch (err) {
+    console.warn('Firestore saveTripItinerary failed, saving to local store:', err);
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      itinerary: cleanItinerary,
+    }));
+  }
 }
 
 /**
@@ -479,40 +602,57 @@ export async function updateTripName(
     throw new Error('Trip name cannot be empty.');
   }
 
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
-
-  if (!tripSnap.exists()) {
-    throw new Error('Trip not found.');
+  if (userId.startsWith('demo-') || tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      name: cleanName,
+    }));
   }
 
-  const tripData = tripSnap.data() as Trip;
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
 
-  // Verify role: Admin or Co-admin
-  const isCreatorAdmin = tripData.adminId === userId;
-  const isCoAdmin = tripData.coAdminId === userId;
+    if (!tripSnap.exists()) {
+      return updateLocalTrip(tripId, (trip) => ({
+        ...trip,
+        name: cleanName,
+      }));
+    }
 
-  let userRole: TripMemberRole = isCreatorAdmin ? 'admin' : isCoAdmin ? 'co-admin' : 'member';
-  const memberRef = doc(db, 'trips', tripId, 'members', userId);
-  const memberSnap = await getDoc(memberRef);
-  if (memberSnap.exists()) {
-    userRole = memberSnap.data().role as TripMemberRole;
+    const tripData = tripSnap.data() as Trip;
+
+    const isCreatorAdmin = tripData.adminId === userId;
+    const isCoAdmin = tripData.coAdminId === userId;
+
+    let userRole: TripMemberRole = isCreatorAdmin ? 'admin' : isCoAdmin ? 'co-admin' : 'member';
+    const memberRef = doc(db, 'trips', tripId, 'members', userId);
+    const memberSnap = await getDoc(memberRef);
+    if (memberSnap.exists()) {
+      userRole = memberSnap.data().role as TripMemberRole;
+    }
+
+    if (userRole !== 'admin' && userRole !== 'co-admin') {
+      throw new Error('Only trip admins and co-admins can edit the trip name.');
+    }
+
+    await updateDoc(tripRef, {
+      name: cleanName,
+      updatedAt: serverTimestamp(),
+    });
+
+    const updatedSnap = await getDoc(tripRef);
+    return {
+      ...updatedSnap.data(),
+      id: updatedSnap.id,
+    } as Trip;
+  } catch (err) {
+    console.warn('Firestore updateTripName failed, updating locally:', err);
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      name: cleanName,
+    }));
   }
-
-  if (userRole !== 'admin' && userRole !== 'co-admin') {
-    throw new Error('Only trip admins and co-admins can edit the trip name.');
-  }
-
-  await updateDoc(tripRef, {
-    name: cleanName,
-    updatedAt: serverTimestamp(),
-  });
-
-  const updatedSnap = await getDoc(tripRef);
-  return {
-    ...updatedSnap.data(),
-    id: updatedSnap.id,
-  } as Trip;
 }
 
 /**
@@ -521,40 +661,49 @@ export async function updateTripName(
  * Cleans up all member subcollection documents and the trip document itself.
  */
 export async function deleteTrip(tripId: string, userId: string): Promise<void> {
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
-
-  if (!tripSnap.exists()) {
-    return; // Already deleted
+  if (userId.startsWith('demo-') || tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
+    deleteLocalTrip(tripId);
+    return;
   }
 
-  const tripData = tripSnap.data() as Trip;
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
 
-  // Strict Admin-only verification
-  let isAuthorizedAdmin = tripData.adminId === userId;
-  if (!isAuthorizedAdmin) {
-    const memberRef = doc(db, 'trips', tripId, 'members', userId);
-    const memberSnap = await getDoc(memberRef);
-    if (memberSnap.exists() && memberSnap.data().role === 'admin') {
-      isAuthorizedAdmin = true;
+    if (!tripSnap.exists()) {
+      deleteLocalTrip(tripId);
+      return;
     }
+
+    const tripData = tripSnap.data() as Trip;
+
+    let isAuthorizedAdmin = tripData.adminId === userId;
+    if (!isAuthorizedAdmin) {
+      const memberRef = doc(db, 'trips', tripId, 'members', userId);
+      const memberSnap = await getDoc(memberRef);
+      if (memberSnap.exists() && memberSnap.data().role === 'admin') {
+        isAuthorizedAdmin = true;
+      }
+    }
+
+    if (!isAuthorizedAdmin) {
+      throw new Error('Only the trip admin can delete this trip.');
+    }
+
+    const membersRef = collection(db, 'trips', tripId, 'members');
+    const membersSnap = await getDocs(membersRef);
+
+    const batch = writeBatch(db);
+    for (const mDoc of membersSnap.docs) {
+      batch.delete(mDoc.ref);
+    }
+    batch.delete(tripRef);
+
+    await batch.commit();
+  } catch (err) {
+    console.warn('Firestore deleteTrip failed, deleting locally:', err);
+    deleteLocalTrip(tripId);
   }
-
-  if (!isAuthorizedAdmin) {
-    throw new Error('Only the trip admin can delete this trip.');
-  }
-
-  // Delete all members in the subcollection and the trip document
-  const membersRef = collection(db, 'trips', tripId, 'members');
-  const membersSnap = await getDocs(membersRef);
-
-  const batch = writeBatch(db);
-  for (const mDoc of membersSnap.docs) {
-    batch.delete(mDoc.ref);
-  }
-  batch.delete(tripRef);
-
-  await batch.commit();
 }
 
 /**
@@ -569,51 +718,68 @@ export async function updateTripStay(
   stay: TripStay,
   userId: string
 ): Promise<Trip> {
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
-
-  if (!tripSnap.exists()) {
-    throw new Error('Trip not found.');
-  }
-
-  const tripData = tripSnap.data() as Trip;
-
-  // Verify role: Admin or Co-admin
-  const isCreatorAdmin = tripData.adminId === userId;
-  const isCoAdmin = tripData.coAdminId === userId;
-
-  let userRole: TripMemberRole = isCreatorAdmin ? 'admin' : isCoAdmin ? 'co-admin' : 'member';
-  const memberRef = doc(db, 'trips', tripId, 'members', userId);
-  const memberSnap = await getDoc(memberRef);
-  if (memberSnap.exists()) {
-    userRole = memberSnap.data().role as TripMemberRole;
-  }
-
-  if (userRole !== 'admin' && userRole !== 'co-admin') {
-    throw new Error('Only trip admins and co-admins can manage accommodation details.');
-  }
-
   const cleanStay = cleanUndefinedFields(stay);
 
-  const updates: Record<string, unknown> = {
-    stay: cleanStay,
-    updatedAt: serverTimestamp(),
-  };
-
-  if (tripData.planning) {
-    updates['planning.stay'] = cleanStay;
-  }
-  if (tripData.itinerary && tripData.itinerary.planningSnapshot) {
-    updates['itinerary.planningSnapshot.stay'] = cleanStay;
+  if (userId.startsWith('demo-') || tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      stay: cleanStay,
+    }));
   }
 
-  await updateDoc(tripRef, updates);
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
 
-  const updatedSnap = await getDoc(tripRef);
-  return {
-    ...updatedSnap.data(),
-    id: updatedSnap.id,
-  } as Trip;
+    if (!tripSnap.exists()) {
+      return updateLocalTrip(tripId, (trip) => ({
+        ...trip,
+        stay: cleanStay,
+      }));
+    }
+
+    const tripData = tripSnap.data() as Trip;
+
+    const isCreatorAdmin = tripData.adminId === userId;
+    const isCoAdmin = tripData.coAdminId === userId;
+
+    let userRole: TripMemberRole = isCreatorAdmin ? 'admin' : isCoAdmin ? 'co-admin' : 'member';
+    const memberRef = doc(db, 'trips', tripId, 'members', userId);
+    const memberSnap = await getDoc(memberRef);
+    if (memberSnap.exists()) {
+      userRole = memberSnap.data().role as TripMemberRole;
+    }
+
+    if (userRole !== 'admin' && userRole !== 'co-admin') {
+      throw new Error('Only trip admins and co-admins can manage accommodation details.');
+    }
+
+    const updates: Record<string, unknown> = {
+      stay: cleanStay,
+      updatedAt: serverTimestamp(),
+    };
+
+    if (tripData.planning) {
+      updates['planning.stay'] = cleanStay;
+    }
+    if (tripData.itinerary && tripData.itinerary.planningSnapshot) {
+      updates['itinerary.planningSnapshot.stay'] = cleanStay;
+    }
+
+    await updateDoc(tripRef, updates);
+
+    const updatedSnap = await getDoc(tripRef);
+    return {
+      ...updatedSnap.data(),
+      id: updatedSnap.id,
+    } as Trip;
+  } catch (err) {
+    console.warn('Firestore updateTripStay failed, saving locally:', err);
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      stay: cleanStay,
+    }));
+  }
 }
 
 /**
@@ -625,48 +791,66 @@ export async function removeTripStay(
   tripId: string,
   userId: string
 ): Promise<Trip> {
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
-
-  if (!tripSnap.exists()) {
-    throw new Error('Trip not found.');
+  if (userId.startsWith('demo-') || tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      stay: null,
+    }));
   }
 
-  const tripData = tripSnap.data() as Trip;
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
 
-  const isCreatorAdmin = tripData.adminId === userId;
-  const isCoAdmin = tripData.coAdminId === userId;
+    if (!tripSnap.exists()) {
+      return updateLocalTrip(tripId, (trip) => ({
+        ...trip,
+        stay: null,
+      }));
+    }
 
-  let userRole: TripMemberRole = isCreatorAdmin ? 'admin' : isCoAdmin ? 'co-admin' : 'member';
-  const memberRef = doc(db, 'trips', tripId, 'members', userId);
-  const memberSnap = await getDoc(memberRef);
-  if (memberSnap.exists()) {
-    userRole = memberSnap.data().role as TripMemberRole;
+    const tripData = tripSnap.data() as Trip;
+
+    const isCreatorAdmin = tripData.adminId === userId;
+    const isCoAdmin = tripData.coAdminId === userId;
+
+    let userRole: TripMemberRole = isCreatorAdmin ? 'admin' : isCoAdmin ? 'co-admin' : 'member';
+    const memberRef = doc(db, 'trips', tripId, 'members', userId);
+    const memberSnap = await getDoc(memberRef);
+    if (memberSnap.exists()) {
+      userRole = memberSnap.data().role as TripMemberRole;
+    }
+
+    if (userRole !== 'admin' && userRole !== 'co-admin') {
+      throw new Error('Only trip admins and co-admins can manage accommodation details.');
+    }
+
+    const updates: Record<string, unknown> = {
+      stay: null,
+      updatedAt: serverTimestamp(),
+    };
+
+    if (tripData.planning) {
+      updates['planning.stay'] = null;
+    }
+    if (tripData.itinerary && tripData.itinerary.planningSnapshot) {
+      updates['itinerary.planningSnapshot.stay'] = null;
+    }
+
+    await updateDoc(tripRef, updates);
+
+    const updatedSnap = await getDoc(tripRef);
+    return {
+      ...updatedSnap.data(),
+      id: updatedSnap.id,
+    } as Trip;
+  } catch (err) {
+    console.warn('Firestore removeTripStay failed, clearing locally:', err);
+    return updateLocalTrip(tripId, (trip) => ({
+      ...trip,
+      stay: null,
+    }));
   }
-
-  if (userRole !== 'admin' && userRole !== 'co-admin') {
-    throw new Error('Only trip admins and co-admins can manage accommodation details.');
-  }
-
-  const updates: Record<string, unknown> = {
-    stay: null,
-    updatedAt: serverTimestamp(),
-  };
-
-  if (tripData.planning) {
-    updates['planning.stay'] = null;
-  }
-  if (tripData.itinerary && tripData.itinerary.planningSnapshot) {
-    updates['itinerary.planningSnapshot.stay'] = null;
-  }
-
-  await updateDoc(tripRef, updates);
-
-  const updatedSnap = await getDoc(tripRef);
-  return {
-    ...updatedSnap.data(),
-    id: updatedSnap.id,
-  } as Trip;
 }
 
 /**
@@ -687,53 +871,91 @@ export async function updateDailyActualExpense(
     throw new Error('Expenditure amount must be a positive number or zero.');
   }
 
-  const tripRef = doc(db, 'trips', tripId);
-  const tripSnap = await getDoc(tripRef);
-
-  if (!tripSnap.exists()) {
-    throw new Error('Trip not found.');
+  if (userId.startsWith('demo-') || tripId.startsWith('trip-') || tripId.startsWith('demo-')) {
+    return updateLocalTrip(tripId, (trip) => {
+      const existingExpenses = (trip.actualDailyExpenses || {}) as Record<string | number, number>;
+      const updatedExpenses: Record<string, number> = {};
+      Object.keys(existingExpenses).forEach((key) => {
+        updatedExpenses[key] = Number(existingExpenses[key]);
+      });
+      updatedExpenses[String(dayNumber)] = Number(actualAmount);
+      return {
+        ...trip,
+        actualDailyExpenses: updatedExpenses,
+      };
+    });
   }
 
-  const tripData = tripSnap.data() as Trip;
+  try {
+    const tripRef = doc(db, 'trips', tripId);
+    const tripSnap = await getDoc(tripRef);
 
-  // Verify caller is a member, co-admin, or admin of this trip
-  const isCreatorAdmin = tripData.adminId === userId;
-  const isCoAdmin = tripData.coAdminId === userId;
-  let isAuthorized = isCreatorAdmin || isCoAdmin;
-
-  if (!isAuthorized) {
-    const memberRef = doc(db, 'trips', tripId, 'members', userId);
-    const memberSnap = await getDoc(memberRef);
-    if (memberSnap.exists()) {
-      isAuthorized = true;
+    if (!tripSnap.exists()) {
+      return updateLocalTrip(tripId, (trip) => {
+        const existingExpenses = (trip.actualDailyExpenses || {}) as Record<string | number, number>;
+        const updatedExpenses: Record<string, number> = {};
+        Object.keys(existingExpenses).forEach((key) => {
+          updatedExpenses[key] = Number(existingExpenses[key]);
+        });
+        updatedExpenses[String(dayNumber)] = Number(actualAmount);
+        return {
+          ...trip,
+          actualDailyExpenses: updatedExpenses,
+        };
+      });
     }
+
+    const tripData = tripSnap.data() as Trip;
+
+    const isCreatorAdmin = tripData.adminId === userId;
+    const isCoAdmin = tripData.coAdminId === userId;
+    let isAuthorized = isCreatorAdmin || isCoAdmin;
+
+    if (!isAuthorized) {
+      const memberRef = doc(db, 'trips', tripId, 'members', userId);
+      const memberSnap = await getDoc(memberRef);
+      if (memberSnap.exists()) {
+        isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized) {
+      throw new Error('Only trip members and organizers can update trip expenses.');
+    }
+
+    const existingExpenses = (tripData.actualDailyExpenses || {}) as Record<string | number, number>;
+    const updatedExpenses: Record<string, number> = {};
+
+    Object.keys(existingExpenses).forEach((key) => {
+      updatedExpenses[key] = Number(existingExpenses[key]);
+    });
+    updatedExpenses[String(dayNumber)] = Number(actualAmount);
+
+    await updateDoc(tripRef, {
+      actualDailyExpenses: updatedExpenses,
+      updatedAt: serverTimestamp(),
+    });
+
+    const updatedDocSnap = await getDoc(tripRef);
+    return {
+      ...updatedDocSnap.data(),
+      id: updatedDocSnap.id,
+    } as Trip;
+  } catch (err) {
+    console.warn('Firestore updateDailyActualExpense failed, updating locally:', err);
+    return updateLocalTrip(tripId, (trip) => {
+      const existingExpenses = (trip.actualDailyExpenses || {}) as Record<string | number, number>;
+      const updatedExpenses: Record<string, number> = {};
+      Object.keys(existingExpenses).forEach((key) => {
+        updatedExpenses[key] = Number(existingExpenses[key]);
+      });
+      updatedExpenses[String(dayNumber)] = Number(actualAmount);
+      return {
+        ...trip,
+        actualDailyExpenses: updatedExpenses,
+      };
+    });
   }
-
-  if (!isAuthorized) {
-    throw new Error('Only trip members and organizers can update trip expenses.');
-  }
-
-  // Update specific day key in actualDailyExpenses map
-  const existingExpenses = (tripData.actualDailyExpenses || {}) as Record<string | number, number>;
-  const updatedExpenses: Record<string, number> = {};
-
-  // Preserve existing day expenses
-  Object.keys(existingExpenses).forEach((key) => {
-    updatedExpenses[key] = Number(existingExpenses[key]);
-  });
-  // Set updated day amount
-  updatedExpenses[String(dayNumber)] = Number(actualAmount);
-
-  await updateDoc(tripRef, {
-    actualDailyExpenses: updatedExpenses,
-    updatedAt: serverTimestamp(),
-  });
-
-  const updatedDocSnap = await getDoc(tripRef);
-  return {
-    ...updatedDocSnap.data(),
-    id: updatedDocSnap.id,
-  } as Trip;
 }
 
 
